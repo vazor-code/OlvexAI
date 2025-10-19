@@ -9,27 +9,54 @@ import re
 import html
 import uuid
 from urllib.parse import urlparse
-from io import StringIO
-
+import json
+from pathlib import Path
+from typing import List
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
-from aiogram.types import Message
+from aiogram.types import Message, FSInputFile
 
 # Загрузка переменных окружения
 load_dotenv()
 
+# Путь к файлу с ID пользователей
+USERS_FILE = Path("user_ids.json")
+
+def load_user_ids():
+    if USERS_FILE.exists():
+        try:
+            with open(USERS_FILE, 'r') as f:
+                return set(int(x) for x in json.load(f))
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return set()
+
+def save_user_ids(user_ids_set):
+    with open(USERS_FILE, 'w') as f:
+        json.dump(sorted(list(user_ids_set)), f)
+
+# Глобальные переменные
+user_ids = load_user_ids()
+user_context = {}
+user_model = {}
+user_last_message = {}
+FLOOD_COOLDOWN = 1.5
+MAX_CONTEXT_MESSAGES = 10
+
+# Укажите ваш Telegram ID!
+ADMIN_ID = 1680340118  # ⚠️ ЗАМЕНИТЕ НА СВОЙ ID!
+
 # Цветной логгер
 class ColoredFormatter(logging.Formatter):
     COLORS = {
-        'INFO': '\x1b[36m', 'WARNING': '\x1b[33m', 'ERROR': '\x1b[31m',
-        'CRITICAL': '\x1b[35m', 'DEBUG': '\x1b[37m', 'RESET': '\x1b[0m'
+        "INFO": "\x1b[36m", "WARNING": "\x1b[33m", "ERROR": "\x1b[31m",
+        "CRITICAL": "\x1b[35m", "DEBUG": "\x1b[37m", "RESET": "\x1b[0m"
     }
-
     def format(self, record):
-        color = self.COLORS.get(record.levelname, self.COLORS['RESET'])
-        reset = self.COLORS['RESET']
+        color = self.COLORS.get(record.levelname, self.COLORS["RESET"])
+        reset = self.COLORS["RESET"]
         timestamp = datetime.now().strftime("%H:%M:%S")
         return f"{color}⚡️[{timestamp}] {record.levelname:>8}{reset} [{record.name}] {record.getMessage()}"
 
@@ -38,7 +65,6 @@ logger.setLevel(logging.INFO)
 handler = logging.StreamHandler(sys.stdout)
 handler.setFormatter(ColoredFormatter())
 logger.addHandler(handler)
-
 logging.getLogger("aiogram").handlers.clear()
 logging.getLogger("aiogram").addHandler(handler)
 logging.getLogger("aiogram").setLevel(logging.INFO)
@@ -49,7 +75,6 @@ AI_TOKEN = getenv("AI_TOKEN")
 if not TOKEN or not AI_TOKEN:
     raise RuntimeError("❌ BOT_TOKEN или AI_TOKEN не найден. Проверьте .env")
 
-# ✅ Исправлено: убраны ВСЕ пробелы в URL!
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=AI_TOKEN
@@ -61,15 +86,15 @@ router = Router()
 openai_semaphore = asyncio.Semaphore(3)
 
 # ---------------------------
-# Парсинг кода и HTML
+# Markdown → HTML
 # ---------------------------
 
-_code_block_pattern = re.compile(r'```(\w*)\s*\n(.*?)\n```', re.DOTALL | re.IGNORECASE)
+_markdown_code_pattern = re.compile(r"```(\w*)\s*\n(.*?)\n```", re.DOTALL | re.IGNORECASE)
 _link_pattern = re.compile(r'<a\s+href\s*=\s*["\']([^"\']*)["\']\s*>(.*?)</a>', re.IGNORECASE | re.DOTALL)
-_b_pattern = re.compile(r'<b>(.*?)</b>', re.IGNORECASE | re.DOTALL)
-_i_pattern = re.compile(r'<i>(.*?)</i>', re.IGNORECASE | re.DOTALL)
-_u_pattern = re.compile(r'<u>(.*?)</u>', re.IGNORECASE | re.DOTALL)
-_s_pattern = re.compile(r'<s>(.*?)</s>', re.IGNORECASE | re.DOTALL)
+_b_pattern = re.compile(r"<b>(.*?)</b>", re.IGNORECASE | re.DOTALL)
+_i_pattern = re.compile(r"<i>(.*?)</i>", re.IGNORECASE | re.DOTALL)
+_u_pattern = re.compile(r"<u>(.*?)</u>", re.IGNORECASE | re.DOTALL)
+_s_pattern = re.compile(r"<s>(.*?)</s>", re.IGNORECASE | re.DOTALL)
 
 ALLOWED_SCHEMES = ("http", "https")
 
@@ -80,289 +105,362 @@ def _is_safe_href(href: str) -> bool:
     except Exception:
         return False
 
-def extract_code_blocks(text: str):
-    """Извлекает блоки кода: (остальной текст, [(язык, код)])"""
-    codes = []
-    parts = []
-    last_end = 0
+import markdown2
+from urllib.parse import urlparse
 
-    for match in _code_block_pattern.finditer(text):
-        if match.start() > last_end:
-            parts.append(('text', text[last_end:match.start()]))
-        lang = match.group(1).strip() or "txt"
-        code = match.group(2).strip('\n')
-        codes.append((lang, code))
-        last_end = match.end()
+def _is_safe_href(href: str) -> bool:
+    try:
+        parsed = urlparse(href)
+        return parsed.scheme.lower() in ALLOWED_SCHEMES and bool(parsed.netloc)
+    except Exception:
+        return False
 
-    if last_end < len(text):
-        parts.append(('text', text[last_end:]))
+# вставьте это вместо вашей markdown_to_html_safe + отправки по кускам
 
-    return parts, codes
+TG_LIMIT = 4096
 
-def sanitize_ai_html(text: str) -> str:
-    """Оставляет только безопасные HTML-теги."""
-    placeholders = {}
+def markdown_to_html_safe(text: str) -> str:
+    """
+    Преобразует Markdown (включая ```блоки``` и `inline`) в безопасный HTML,
+    экранирует угловые скобки вне тегов, сохраняет <pre><code>...</code></pre> и <code>...</code>.
+    """
+    text = (text or "").strip()
 
-    def make_token():
-        return f"__PH_{uuid.uuid4().hex}__"
+    # --- Извлекаем и экранируем блоки кода и inline-код, заменяя на плейсхолдеры
+    code_blocks = []
 
-    temp = text
-    temp = _link_pattern.sub(lambda m: (t := make_token(), placeholders.update({t: ("a", m.group(1), m.group(2))}) or t)[-1], temp)
-    temp = _b_pattern.sub(lambda m: (t := make_token(), placeholders.update({t: ("b", m.group(1))}) or t)[-1], temp)
-    temp = _i_pattern.sub(lambda m: (t := make_token(), placeholders.update({t: ("i", m.group(1))}) or t)[-1], temp)
-    temp = _u_pattern.sub(lambda m: (t := make_token(), placeholders.update({t: ("u", m.group(1))}) or t)[-1], temp)
-    temp = _s_pattern.sub(lambda m: (t := make_token(), placeholders.update({t: ("s", m.group(1))}) or t)[-1], temp)
+    def repl_backticks(m):
+        inner = m.group(1)
+        escaped = html.escape(inner)
+        code_blocks.append(f"<pre><code>{escaped}</code></pre>")
+        return f"@@CODE_{len(code_blocks)-1}@@"
 
-    escaped = html.escape(temp)
+    text = re.sub(r"```(?:\w*)\n(.*?)```", repl_backticks, text, flags=re.DOTALL)
 
-    for token, data in placeholders.items():
-        tag = data[0]
-        if tag == "a":
-            href, inner = data[1], data[2]
-            inner_esc = html.escape(inner)
-            if _is_safe_href(href):
-                href_esc = html.escape(href, quote=True)
-                replacement = f'<a href="{href_esc}">{inner_esc}</a>'
-            else:
-                replacement = inner_esc
-        elif tag == "b":
-            replacement = f"<b>{html.escape(data[1])}</b>"
-        elif tag == "i":
-            replacement = f"<i>{html.escape(data[1])}</i>"
-        elif tag == "u":
-            replacement = f"<u>{html.escape(data[1])}</u>"
-        elif tag == "s":
-            replacement = f"<s>{html.escape(data[1])}</s>"
+    # --- Заменяем заголовки ## и ### на ▎ ---
+    text = re.sub(r"^###\s*(.*)", r"▎ \1", text, flags=re.MULTILINE)
+    text = re.sub(r"^##\s*(.*)", r"▎ \1", text, flags=re.MULTILINE)
+
+    def repl_inline(m):
+        inner = m.group(1)
+        escaped = html.escape(inner)
+        code_blocks.append(f"<code>{escaped}</code>")
+        return f"@@CODE_{len(code_blocks)-1}@@"
+
+    text = re.sub(r"`([^`]+?)`", repl_inline, text, flags=re.DOTALL)
+
+    # --- Преобразования Markdown для НЕ-кодовой части ---
+    text = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", text, flags=re.DOTALL)
+    text = re.sub(r"\*(.*?)\*", r"<i>\1</i>", text, flags=re.DOTALL)
+    text = re.sub(r"^\s*[-*]\s+(.*)", r"• \1", text, flags=re.MULTILINE)
+
+    def sanitize_links(match):
+        inner = match.group(1)
+        href = match.group(2)
+        if _is_safe_href(href):
+            return f'<a href="{html.escape(href, quote=True)}">{html.escape(inner)}</a>'
         else:
-            replacement = html.escape(str(data))
-        escaped = escaped.replace(token, replacement)
+            return html.escape(inner)
+    text = re.sub(r"\[(.*?)\]\((.*?)\)", sanitize_links, text, flags=re.DOTALL)
 
-    return escaped
+    text = re.sub(r"</?(p|div|span|br|hr|h\d)[^>]*>", "", text, flags=re.IGNORECASE)
 
-# Очистка мусора из ответа модели
+    # --- Экранируем угловые скобки только вне тегов и плейсхолдеров
+    def escape_outside(m):
+        tag, txt = m.group(1), m.group(2)
+        if tag:
+            return tag
+        else:
+            return txt.replace("<", "&lt;").replace(">", "&gt;")
+    # Разделяем на теги и текст; теги (включая те, что мы хотим оставить) пропускаем через group(1)
+    text = re.sub(r"(<[^>]+>)|([^<>]+)", lambda m: escape_outside(m), text)
+
+    # --- Вернём кодовые блоки
+    for i, block in enumerate(code_blocks):
+        text = text.replace(f"@@CODE_{i}@@", block)
+
+    text = text.replace("\r\n", "\n")  # нормализуем переводы строк
+    text = re.sub(r"\n{2,}", "\n\n", text)  # минимум две строки для абзаца
+    return text.strip()
+
+
+def split_message_preserve_code(html_text: str, limit: int = TG_LIMIT) -> List[str]:
+    """
+    Разбивает html_text на части длиной <= limit.
+    Не разрывает внутри <pre><code>...</code></pre>.
+    Если отдельный кодовый блок > limit, разрезает его на несколько корректных <pre><code>..</code></pre>.
+    """
+    parts: List[str] = []
+
+    # Найдём все <pre><code>...</code></pre>
+    code_re = re.compile(r"<pre><code>.*?</code></pre>", flags=re.DOTALL | re.IGNORECASE)
+    segments = []
+    last = 0
+    for m in code_re.finditer(html_text):
+        if m.start() > last:
+            segments.append(("text", html_text[last:m.start()]))
+        segments.append(("code", m.group(0)))
+        last = m.end()
+    if last < len(html_text):
+        segments.append(("text", html_text[last:]))
+
+    cur = ""
+
+    def flush_cur():
+        nonlocal cur
+        if cur:
+            parts.append(cur)
+            cur = ""
+
+    for kind, seg in segments:
+        if kind == "text":
+            # пытаемся добавить сегмент целиком, иначе разбиваем аккуратно
+            if len(cur) + len(seg) <= limit:
+                cur += seg
+            else:
+                remaining = seg
+                while remaining:
+                    space_left = limit - len(cur)
+                    if space_left <= 0:
+                        flush_cur()
+                        space_left = limit
+                    if len(remaining) <= space_left:
+                        cur += remaining
+                        remaining = ""
+                    else:
+                        # стараемся разрезать по последнему переводу строки внутри лимита
+                        cut = remaining.rfind("\n", 0, space_left)
+                        if cut <= 0:
+                            # fallback: найдем безопасную позицию (чтобы не разорвать тег)
+                            cut = space_left
+                            safe_cut = None
+                            # откатываемся до 500 символов в поиске безопасного края
+                            start_check = max(0, cut - 500)
+                            prefix = cur
+                            for idx in range(cut, start_check - 1, -1):
+                                seg_prefix = prefix + remaining[:idx]
+                                if seg_prefix.count("<") == seg_prefix.count(">"):
+                                    safe_cut = idx
+                                    break
+                            if safe_cut:
+                                cut = safe_cut
+                        cur += remaining[:cut]
+                        remaining = remaining[cut:]
+                        flush_cur()
+        else:  # code
+            # если код помещается в текущую часть — добавляем
+            if len(cur) + len(seg) <= limit:
+                cur += seg
+            else:
+                # сначала сбрасываем накопленное
+                flush_cur()
+                # извлечём содержимое кода (без тегов)
+                inner = re.sub(r"(?i)^<pre><code>|</code></pre>$", "", seg)
+                # теперь разбиваем содержимое на куски, чтобы каждый фрагмент влезал
+                overhead = len("<pre><code></code></pre>")
+                max_chunk = max(1, limit - overhead)
+                start = 0
+                while start < len(inner):
+                    chunk = inner[start:start + max_chunk]
+                    parts.append(f"<pre><code>{chunk}</code></pre>")
+                    start += max_chunk
+
+    flush_cur()
+    return parts
+
+
 def clean_ai_response(text: str) -> str:
-    """
-    Удаляет системные токены: <s>, [OUT],  <im_start>, и т.п.
-    """
-    text = re.sub(r'<\|.*?\|>', '', text)
-    text = re.sub(r'\[\/?OUT\]', '', text)
-    text = re.sub(r'<<SYS>>.*?<<\/SYS>>', '', text, flags=re.DOTALL)
-    text = re.sub(r'<\|im_start\|>.*?<\|im_end\|>', '', text, flags=re.DOTALL)
-    text = re.sub(r'^<s>\s*', '', text)
-    text = re.sub(r'\s*</s>$', '', text)
+    text = re.sub(r"<\|.*?\|>", "", text)
+    text = re.sub(r"\[\/?OUT\]", "", text)
+    text = re.sub(r"<<SYS>>.*?<<\/SYS>>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<\|im_start\|>.*?<\|im_end\|>", "", text, flags=re.DOTALL)
+    text = re.sub(r"^<s>\s*", "", text)
+    text = re.sub(r"\s*</s>$", "", text)
+    text = re.sub(r"<[^>]+>", "", text)  # Remove any HTML tags to prevent parsing errors
     return text.strip()
 
 # ---------------------------
-# Глобальные переменные
+# Модели
 # ---------------------------
 
-user_context = {}
-user_model = {}
-user_last_message = {}
-FLOOD_COOLDOWN = 1.5
-
-# 🆕 Все доступные БЕСПЛАТНЫЕ модели (актуальные на OpenRouter)
 AVAILABLE_MODELS = {
-    # DeepSeek
     "deepseek": "deepseek/deepseek-chat-v3.1",
     "r1": "deepseek/deepseek-r1-0528",
     "qwen8b": "deepseek/deepseek-r1-0528-qwen3-8b",
-
-    # Mistral
     "mistral": "mistralai/mistral-small-3.2-24b-instruct",
-
-    # Qwen
     "qwen": "qwen/qwen3-coder",
-    "qwen4b": "qwen/qwen3-4b",
-
-    # Google
     "gemma": "google/gemma-3n-e4b-it",
-
-    # OpenAI OSS
     "gpt20b": "openai/gpt-oss-20b",
 }
 
-# Человеческие названия моделей
+
 MODEL_NAMES = {
     "deepseek": "🧠 DeepSeek Chat v3.1",
     "r1": "🚀 DeepSeek R1 (0528)",
     "qwen8b": "🧩 DeepSeek + Qwen3 8B",
     "mistral": "🔥 Mistral Small 24B",
     "qwen": "💻 Qwen3 Coder",
-    "qwen4b": "🧠 Qwen3 4B",
     "gemma": "🟢 Google Gemma 3n E4B",
     "gpt20b": "🔵 GPT-OSS 20B",
 }
 
 # ---------------------------
-# Хэндлеры
+# Команды
 # ---------------------------
 
 @router.message(CommandStart())
-async def command_start_handler(message: Message) -> None:
+async def command_start_handler(message: Message):
     user = message.from_user
+    if user.id not in user_ids:
+        user_ids.add(user.id)
+        save_user_ids(user_ids)
+        logger.info(f"📥 Новый пользователь: {user.full_name} (ID: {user.id})")
     safe_name = html.escape(user.full_name or "Пользователь")
-    welcome_text = (
+    text = (
         f"Привет, <b>{safe_name}</b>! 👋\n\n"
         "🧠 Я — ваш ИИ-ассистент.\n"
         "Задавайте вопросы, просите написать код, объяснить тему.\n\n"
-        "<i>Код будет отображаться красиво — его можно копировать одним кликом.</i>\n\n"
         "📌 Используйте /help — чтобы узнать все возможности."
     )
-    logger.info(f"👋 /start от {user.full_name}")
-    await message.answer(welcome_text, parse_mode=ParseMode.HTML)
-
+    await message.answer(text, parse_mode=ParseMode.HTML)
 
 @router.message(F.text.startswith("/help"))
 async def help_command(message: Message):
     models_list = "\n".join([f"🔸 <code>/{key}</code> — {value}" for key, value in MODEL_NAMES.items()])
-    
-    help_text = (
+    text = (
         "📚 <b>OlvexAI | DeepSeek</b>\n"
         "Умный бот, готовый ответить на любые вопросы.\n\n"
         "🔹 <b>Команды:</b>\n"
-        "🔸 <code>/start</code> — начать\n"
-        "🔸 <code>/help</code> — это меню\n"
-        "🔸 <code>/model</code> — текущая модель\n\n"
+        "🔸 /start — начать\n"
+        "🔸 /help — это меню\n"
+        "🔸 /model — текущая модель\n"
+        "🔸 /clear — очистить историю диалога\n"
+        "🔸 /retry — перегенерировать последний ответ\n"
+        "🔸 /stats — статистика (только для админа)\n"
+        "🔸 /broadcast — рассылка (только для админа)\n\n"
         f"🔹 <b>Модели:</b>\n{models_list}\n\n"
         "📎 Прикрепите файл (.txt, .py, .js и др.) — я прочитаю и объясню.\n\n"
         "💡 Бот запоминает контекст — можно вести диалог.\n"
         "⚠️ Сервера могут временно отключаться.\n"
         "👤 Разработка: @vazor_code"
     )
-    await message.answer(help_text, parse_mode=ParseMode.HTML)
-
+    await message.answer(text, parse_mode=ParseMode.HTML)
 
 @router.message(F.text.startswith("/model"))
-async def change_model(message: Message):
+async def show_model(message: Message):
     user_id = message.from_user.id
-    args = message.text.split(maxsplit=1)
-    
-    if len(args) == 1:
-        current_model = user_model.get(user_id, "deepseek/deepseek-chat-v3.1")
-        model_key = next((k for k, v in AVAILABLE_MODELS.items() if v == current_model), "deepseek")
-        display_name = MODEL_NAMES.get(model_key, "неизвестная")
-        await message.answer(
-            f"🔹 Текущая модель: <b>{display_name}</b> (<code>{model_key}</code>)\n\n"
-            "Доступные:\n"
-            "/model deepseek — DeepSeek Chat v3.1\n"
-            "/model r1 — DeepSeek R1 0528\n"
-            "/model mistral — Mistral Small 24B\n"
-            "/model qwen — Qwen3 Coder\n"
-            "/model gemma — Google Gemma 3n E4B",
-            parse_mode=ParseMode.HTML
-        )
+    model = user_model.get(user_id, "deepseek/deepseek-chat-v3.1")
+    key = next((k for k, v in AVAILABLE_MODELS.items() if v == model), "deepseek")
+    await message.answer(f"📦 Текущая модель: <b>{MODEL_NAMES[key]}</b>", parse_mode=ParseMode.HTML)
+
+# --- Переключение моделей ---
+@router.message(F.text.regexp(r"^/(deepseek|r1|qwen8b|mistral|qwen|qwen4b|gemma|gpt20b)$"))
+async def quick_switch(message: Message):
+    key = message.text.lstrip("/")
+    user_model[message.from_user.id] = AVAILABLE_MODELS[key]
+    await message.answer(f"✅ Модель переключена на <b>{MODEL_NAMES[key]}</b>", parse_mode=ParseMode.HTML)
+
+# --- Очистка контекста ---
+@router.message(F.text == "/clear")
+async def clear_context(message: Message):
+    user_context.pop(message.from_user.id, None)
+    await message.answer("🧹 Контекст очищен!")
+
+
+# --- Админ-команды ---
+@router.message(F.text.startswith("/broadcast"))
+async def broadcast_message(message: Message):
+    global bot
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("❌ У вас нет прав на рассылку.")
+        return
+    if bot is None:
+        await message.answer("⚠️ Бот ещё не инициализирован.")
         return
 
-    model_key = args[1].strip().lower()
-    if model_key not in AVAILABLE_MODELS:
-        available_list = ", ".join(AVAILABLE_MODELS.keys())
-        await message.answer(f"❌ Модель '{model_key}' не найдена. Доступные: {available_list}")
+    text = message.text[len("/broadcast"):].strip()
+    if not text:
+        await message.answer("📝 Введите текст после команды.")
         return
 
-    user_model[user_id] = AVAILABLE_MODELS[model_key]
-    display_name = MODEL_NAMES[model_key]
-    await message.answer(f"✅ Модель изменена на: <b>{display_name}</b>", parse_mode=ParseMode.HTML)
+    await message.answer("🚀 Рассылка начата...")
+    success = blocked = errors = 0
+    for uid in user_ids:
+        try:
+            await bot.send_message(uid, text, parse_mode=ParseMode.HTML)
+            success += 1
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            if "BotBlocked" in str(e) or "ChatNotFound" in str(e):
+                blocked += 1
+            else:
+                errors += 1
+    await message.answer(f"📬 Рассылка завершена!\n✅ {success} | 🚫 {blocked} | ⚠️ {errors}")
 
 
-# Краткие команды для быстрого переключения
-for model_key in AVAILABLE_MODELS:
+@router.message(F.text == "/stats")
+async def show_stats(message: Message):
+    global bot
+    if message.from_user.id != ADMIN_ID:
+        return
+    if bot is None:
+        await message.answer("⚠️ Бот ещё не инициализирован.")
+        return
 
-    @router.message(F.text == f"/{model_key}")
-    async def quick_model_switch(message: Message, key=model_key):
-        user_id = message.from_user.id
-        user_model[user_id] = AVAILABLE_MODELS[key]
-        display_name = MODEL_NAMES[key]
-        await message.answer(f"✅ Мгновенно переключено на: <b>{display_name}</b>", parse_mode=ParseMode.HTML)
+    total_users = len(user_ids)
+    active_chats = len(user_context)
+    model_usage = {}
+    for uid, model in user_model.items():
+        key = next((k for k, v in AVAILABLE_MODELS.items() if v == model), "unknown")
+        model_usage[key] = model_usage.get(key, 0) + 1
+    usage_list = "\n".join([f"🔸 {MODEL_NAMES.get(k, k)}: {v}" for k, v in sorted(model_usage.items(), key=lambda x: -x[1])])
+    await message.answer(
+        f"📊 <b>Статистика</b>\n\n👥 Пользователей: {total_users}\n💬 Диалогов: {active_chats}\n\n<b>Модели:</b>\n{usage_list}",
+        parse_mode=ParseMode.HTML
+    )
 
+# --- Повтор ---
+@router.message(F.text == "/retry")
+async def retry_last(message: Message):
+    user_id = message.from_user.id
+    if user_id not in user_context or len(user_context[user_id]) < 2:
+        await message.answer("⚠️ Нет предыдущего сообщения для повтора.")
+        return
+    last_user_message = next((m["content"] for m in reversed(user_context[user_id]) if m["role"] == "user"), None)
+    if not last_user_message:
+        await message.answer("⚠️ Не найдено последнее сообщение пользователя.")
+        return
+    await echo_handler(Message(message_id=message.message_id, from_user=message.from_user, text=last_user_message, chat=message.chat))
 
+# --- Отправка файлов ---
 @router.message(F.document)
 async def handle_document(message: Message):
-    user_id = message.from_user.id
-    file = message.document
-    file_name = file.file_name or "без_имени.txt"
-
-    if not file_name.lower().endswith(('.txt', '.py', '.js', '.html', '.css', '.md', '.json', '.yaml', '.yml')):
-        await message.answer("❌ Я могу обрабатывать только текстовые файлы (.txt, .py, .js, .md и т.д.)")
+    doc = message.document
+    if not doc.file_name.lower().endswith((".txt", ".py", ".js", ".md", ".json")):
+        await message.answer("⚠️ Поддерживаются только текстовые файлы.")
         return
+    file = await message.bot.get_file(doc.file_id)
+    path = await message.bot.download_file(file.file_path)
+    content = path.read().decode("utf-8", errors="ignore")
+    user_context.setdefault(message.from_user.id, []).append({"role": "user", "content": f"Файл {doc.file_name}:\n{content}"})
+    await message.answer("📄 Файл получен! Я учту его в контексте.")
 
-    thinking_msg = None  # Объявляем заранее
-
-    try:
-        file_path = await message.bot.download(file)
-        
-        # ✅ Исправлено: используем file_path как путь
-        with open(file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-
-        if len(content) > 4096:
-            content = content[:4096] + "\n... [обрезано]"
-
-        thinking_msg = await message.answer("📄 Читаю файл...")
-
-        async with openai_semaphore:
-            completion = await asyncio.to_thread(
-                lambda: client.chat.completions.create(
-                    model=user_model.get(user_id, "deepseek/deepseek-chat-v3.1"),
-                    messages=[
-                        {"role": "system", "content": "Объясни содержимое файла на русском."},
-                        {"role": "user", "content": f"Файл: {file_name}\n\n{content}"}
-                    ],
-                    temperature=0.7,
-                )
-            )
-
-        raw_reply = completion.choices[0].message.content.strip()
-        cleaned_reply = clean_ai_response(raw_reply)
-        non_code_parts, code_blocks = extract_code_blocks(cleaned_reply)
-
-        await thinking_msg.delete()
-
-        if non_code_parts:
-            full_text = ''.join(part for _, part in non_code_parts)
-            clean_text = sanitize_ai_html(full_text)
-            MAX_LEN = 4096
-            for i in range(0, len(clean_text), MAX_LEN):
-                chunk = clean_text[i:i + MAX_LEN]
-                await message.answer(chunk, parse_mode=ParseMode.HTML)
-
-        MAX_MESSAGE_LENGTH = 4096 - 100
-        for lang, code in code_blocks:
-            code_lines = code.strip().splitlines()
-            chunk = ""
-            current_length = 0
-
-            def make_code_block(text):
-                return f'<pre><code class="language-{html.escape(lang)}">{html.escape(text)}</code></pre>'
-
-            for line in code_lines:
-                line_escaped = html.escape(line) + "\n"
-                if current_length + len(line_escaped) > MAX_MESSAGE_LENGTH:
-                    if chunk:
-                        await message.answer(make_code_block(chunk), parse_mode=ParseMode.HTML)
-                    chunk = line
-                    current_length = len(line_escaped)
-                else:
-                    chunk += line + "\n"
-                    current_length += len(line_escaped)
-
-            if chunk.strip():
-                await message.answer(make_code_block(chunk), parse_mode=ParseMode.HTML)
-
-        logger.info(f"✅ Файл {file_name} обработан")
-
-    except Exception as e:
-        logger.error(f"Ошибка при обработке файла: {e}")
-        if thinking_msg:
-            await thinking_msg.delete()
-        await message.answer("⚠️ Ошибка при чтении файла.")
-
-
+# --- Основной обработчик ---
 @router.message(F.text)
-async def echo_handler(message: Message) -> None:
+async def echo_handler(message: Message):
     user_id = message.from_user.id
+    user = message.from_user
+    if user.id not in user_ids:
+        await message.answer(
+            "⚠️ <b>Привет!</b>\n\n"
+            "Чтобы бот начал сохранять ваш <b>контекст</b> и <b>статистику</b>, "
+            "пожалуйста, напишите команду <code>/start</code>.",
+            parse_mode=ParseMode.HTML
+        )
+        user_ids.add(user.id)
+        save_user_ids(user_ids)
+        return  # дальше не обрабатываем старое сообщение
     now = asyncio.get_event_loop().time()
-
     if user_id in user_last_message and now - user_last_message[user_id] < FLOOD_COOLDOWN:
         return
     user_last_message[user_id] = now
@@ -373,77 +471,25 @@ async def echo_handler(message: Message) -> None:
     thinking_msg = None
     try:
         model = user_model.get(user_id, "deepseek/deepseek-chat-v3.1")
+        user_context.setdefault(user_id, []).append({"role": "user", "content": user_text})
 
-        if user_id not in user_context:
-            user_context[user_id] = []
-
-        user_context[user_id].append({"role": "user", "content": user_text})
-
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "Ты — ИИ-ассистент. Всегда отвечай на русском языке.\n"
-                    "• Для кода используй формат: ```py\\nкод\\n```\n"
-                    "• Для ссылок: <a href='https://example.com'>текст</a>\n"
-                    "• Жирный: <b>текст</b>, курсив: <i>текст</i>\n"
-                    "• Никогда не используй <pre> или <code> в ответе."
-                ),
-            }
-        ] + user_context[user_id]
-
+        messages = [{"role": "system", "content": "Ты — умный ассистент, отвечай по-русски, красиво форматируй код."}] + user_context[user_id]
         thinking_msg = await message.answer("💭 Думаю...")
 
         async with openai_semaphore:
-            completion = await asyncio.to_thread(
-                lambda: client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    temperature=0.7,
-                )
-            )
-
-        raw_reply = completion.choices[0].message.content.strip()
-        cleaned_reply = clean_ai_response(raw_reply)
-        user_context[user_id].append({"role": "assistant", "content": cleaned_reply})
-
-        non_code_parts, code_blocks = extract_code_blocks(cleaned_reply)
-
+            completion = await asyncio.to_thread(lambda: client.chat.completions.create(model=model, messages=messages, temperature=0.7))
+        raw = completion.choices[0].message.content.strip()
+        cleaned = clean_ai_response(raw)
+        user_context[user_id].append({"role": "assistant", "content": cleaned})
+        if len(user_context[user_id]) > MAX_CONTEXT_MESSAGES * 2:
+            user_context[user_id] = user_context[user_id][:1] + user_context[user_id][-MAX_CONTEXT_MESSAGES*2:]
+        html_reply = markdown_to_html_safe(cleaned)
         await thinking_msg.delete()
 
-        if non_code_parts:
-            full_text = ''.join(part for _, part in non_code_parts)
-            clean_text = sanitize_ai_html(full_text)
-            MAX_LEN = 4096
-            for i in range(0, len(clean_text), MAX_LEN):
-                chunk = clean_text[i:i + MAX_LEN]
-                await message.answer(chunk, parse_mode=ParseMode.HTML)
-
-        MAX_MESSAGE_LENGTH = 4096 - 100
-        for lang, code in code_blocks:
-            code_lines = code.strip().splitlines()
-            chunk = ""
-            current_length = 0
-
-            def make_code_block(text):
-                return f'<pre><code class="language-{html.escape(lang)}">{html.escape(text)}</code></pre>'
-
-            for line in code_lines:
-                line_escaped = html.escape(line) + "\n"
-                if current_length + len(line_escaped) > MAX_MESSAGE_LENGTH:
-                    if chunk:
-                        await message.answer(make_code_block(chunk), parse_mode=ParseMode.HTML)
-                    chunk = line
-                    current_length = len(line_escaped)
-                else:
-                    chunk += line + "\n"
-                    current_length += len(line_escaped)
-
-            if chunk.strip():
-                await message.answer(make_code_block(chunk), parse_mode=ParseMode.HTML)
-
+        safe_parts = split_message_preserve_code(html_reply, TG_LIMIT)
+        for part in safe_parts:
+            await message.answer(part, parse_mode=ParseMode.HTML)
         logger.info("✅ Ответ отправлен")
-
     except Exception as e:
         logger.error(f"Ошибка: {e}")
         if thinking_msg:
@@ -454,16 +500,13 @@ async def echo_handler(message: Message) -> None:
         await message.answer("⚠️ Ошибка генерации. Попробуйте позже.")
 
 
-# ---------------------------
-# Запуск бота
-# ---------------------------
-
-async def main() -> None:
+# --- Запуск ---
+async def main():
+    global bot
     bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp.include_router(router)
-    logger.info("🚀 OlvexAI Bot запущен!")
+    logger.info(f"🚀 OlvexAI Bot запущен! Админ: {ADMIN_ID}")
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     try:
