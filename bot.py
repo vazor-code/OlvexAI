@@ -173,7 +173,7 @@ async def echo_handler(message: Message) -> None:
     now = asyncio.get_event_loop().time()
 
     if user_id in user_last_message and now - user_last_message[user_id] < FLOOD_COOLDOWN:
-        return  # Игнорируем слишком частые сообщения
+        return
 
     user_last_message[user_id] = now
 
@@ -219,10 +219,20 @@ async def echo_handler(message: Message) -> None:
                 chunk = cleaned_text[i:i + MAX_LEN]
                 await message.answer(chunk, parse_mode=ParseMode.HTML)
 
-        # Отправляем блоки кода отдельно (как Markdown)
+        # Отправляем блоки кода с кнопкой "Скопировать"
         for lang, code in code_blocks:
-            code_msg = f"```{lang}\n{code}\n```"
-            await message.answer(code_msg, parse_mode=None)
+            # Убираем лишние пробелы в начале/конце
+            code_clean = code.rstrip('\n').lstrip('\n')
+            # Отправляем код как сообщение
+            code_msg = f"```{lang}\n{code_clean}\n```"
+            sent_msg = await message.answer(code_msg, parse_mode=None)
+
+            # Создаём кнопку "Скопировать код"
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📋 Скопировать код", callback_data=f"copy_code_{lang}_{sent_msg.message_id}")]
+            ])
+            # Редактируем сообщение, добавляя кнопку
+            await sent_msg.edit_text(code_msg, reply_markup=keyboard, parse_mode=None)
 
         logger.info(f"✅ Ответ отправлен пользователю {user.full_name}")
 
@@ -238,6 +248,34 @@ async def echo_handler(message: Message) -> None:
 # ---------------------------
 # Запуск бота
 # ---------------------------
+
+from aiogram.filters import CallbackData
+
+class CopyCodeCallback(CallbackData, prefix="copy_code"):
+    lang: str
+    msg_id: int
+
+@router.callback_query(CopyCodeCallback.filter())
+async def copy_code_callback(callback: types.CallbackQuery, callback_data: CopyCodeCallback):
+    # Получаем ID сообщения, где был код
+    msg_id = callback_data.msg_id
+    lang = callback_data.lang
+
+    # Находим сообщение с кодом
+    try:
+        msg = await callback.message.bot.get_message(chat_id=callback.message.chat.id, message_id=msg_id)
+        # Извлекаем текст кода (убираем ```py и ``` из начала и конца)
+        code_text = msg.text
+        if code_text.startswith(f"```{lang}") and code_text.endswith("```"):
+            code_content = code_text[len(f"```{lang}"): -3].rstrip('\n')
+            # Отправляем чистый код как сообщение
+            await callback.message.answer(f"```{lang}\n{code_content}\n```", parse_mode=None)
+            # Уведомляем пользователя
+            await callback.answer("✅ Код скопирован в буфер обмена!", show_alert=True)
+        else:
+            await callback.answer("❌ Не удалось извлечь код.", show_alert=True)
+    except Exception as e:
+        await callback.answer(f"❌ Ошибка: {str(e)}", show_alert=True)
 
 async def main() -> None:
     bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
