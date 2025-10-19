@@ -9,6 +9,7 @@ import re
 import html
 import uuid
 from urllib.parse import urlparse
+from io import StringIO
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
@@ -48,8 +49,11 @@ AI_TOKEN = getenv("AI_TOKEN")
 if not TOKEN or not AI_TOKEN:
     raise RuntimeError("❌ BOT_TOKEN или AI_TOKEN не найден. Проверьте .env")
 
-# ✅ Исправлено: убраны пробелы в URL
-client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=AI_TOKEN)
+# ✅ Исправлено: убраны ВСЕ пробелы в URL!
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=AI_TOKEN
+)
 
 # Настройка бота
 dp = Dispatcher()
@@ -77,7 +81,7 @@ def _is_safe_href(href: str) -> bool:
         return False
 
 def extract_code_blocks(text: str):
-    """Извлекает блоки кода, возвращает (остальной_текст, [(язык, код)])"""
+    """Извлекает блоки кода: (остальной текст, [(язык, код)])"""
     codes = []
     parts = []
     last_end = 0
@@ -135,6 +139,60 @@ def sanitize_ai_html(text: str) -> str:
 
     return escaped
 
+# Очистка мусора из ответа модели
+def clean_ai_response(text: str) -> str:
+    """
+    Удаляет системные токены: <s>, [OUT],  <im_start>, и т.п.
+    """
+    text = re.sub(r'<\|.*?\|>', '', text)
+    text = re.sub(r'\[\/?OUT\]', '', text)
+    text = re.sub(r'<<SYS>>.*?<<\/SYS>>', '', text, flags=re.DOTALL)
+    text = re.sub(r'<\|im_start\|>.*?<\|im_end\|>', '', text, flags=re.DOTALL)
+    text = re.sub(r'^<s>\s*', '', text)
+    text = re.sub(r'\s*</s>$', '', text)
+    return text.strip()
+
+# ---------------------------
+# Глобальные переменные
+# ---------------------------
+
+user_context = {}
+user_model = {}
+user_last_message = {}
+FLOOD_COOLDOWN = 1.5
+
+# 🆕 Все доступные БЕСПЛАТНЫЕ модели (актуальные на OpenRouter)
+AVAILABLE_MODELS = {
+    # DeepSeek
+    "deepseek": "deepseek/deepseek-chat-v3.1",
+    "r1": "deepseek/deepseek-r1-0528",
+    "qwen8b": "deepseek/deepseek-r1-0528-qwen3-8b",
+
+    # Mistral
+    "mistral": "mistralai/mistral-small-3.2-24b-instruct",
+
+    # Qwen
+    "qwen": "qwen/qwen3-coder",
+    "qwen4b": "qwen/qwen3-4b",
+
+    # Google
+    "gemma": "google/gemma-3n-e4b-it",
+
+    # OpenAI OSS
+    "gpt20b": "openai/gpt-oss-20b",
+}
+
+# Человеческие названия моделей
+MODEL_NAMES = {
+    "deepseek": "🧠 DeepSeek Chat v3.1",
+    "r1": "🚀 DeepSeek R1 (0528)",
+    "qwen8b": "🧩 DeepSeek + Qwen3 8B",
+    "mistral": "🔥 Mistral Small 24B",
+    "qwen": "💻 Qwen3 Coder",
+    "qwen4b": "🧠 Qwen3 4B",
+    "gemma": "🟢 Google Gemma 3n E4B",
+    "gpt20b": "🔵 GPT-OSS 20B",
+}
 
 # ---------------------------
 # Хэндлеры
@@ -148,15 +206,157 @@ async def command_start_handler(message: Message) -> None:
         f"Привет, <b>{safe_name}</b>! 👋\n\n"
         "🧠 Я — ваш ИИ-ассистент.\n"
         "Задавайте вопросы, просите написать код, объяснить тему.\n\n"
-        "<i>Код будет отображаться красиво — его можно копировать одним кликом.</i>"
+        "<i>Код будет отображаться красиво — его можно копировать одним кликом.</i>\n\n"
+        "📌 Используйте /help — чтобы узнать все возможности."
     )
     logger.info(f"👋 /start от {user.full_name}")
     await message.answer(welcome_text, parse_mode=ParseMode.HTML)
 
 
-# Защита от флуда
-FLOOD_COOLDOWN = 1.5
-user_last_message = {}
+@router.message(F.text.startswith("/help"))
+async def help_command(message: Message):
+    models_list = "\n".join([f"🔸 <code>/{key}</code> — {value}" for key, value in MODEL_NAMES.items()])
+    
+    help_text = (
+        "📚 <b>OlvexAI | DeepSeek</b>\n"
+        "Умный бот, готовый ответить на любые вопросы.\n\n"
+        "🔹 <b>Команды:</b>\n"
+        "🔸 <code>/start</code> — начать\n"
+        "🔸 <code>/help</code> — это меню\n"
+        "🔸 <code>/model</code> — текущая модель\n\n"
+        f"🔹 <b>Модели:</b>\n{models_list}\n\n"
+        "📎 Прикрепите файл (.txt, .py, .js и др.) — я прочитаю и объясню.\n\n"
+        "💡 Бот запоминает контекст — можно вести диалог.\n"
+        "⚠️ Сервера могут временно отключаться.\n"
+        "👤 Разработка: @vazor_code"
+    )
+    await message.answer(help_text, parse_mode=ParseMode.HTML)
+
+
+@router.message(F.text.startswith("/model"))
+async def change_model(message: Message):
+    user_id = message.from_user.id
+    args = message.text.split(maxsplit=1)
+    
+    if len(args) == 1:
+        current_model = user_model.get(user_id, "deepseek/deepseek-chat-v3.1")
+        model_key = next((k for k, v in AVAILABLE_MODELS.items() if v == current_model), "deepseek")
+        display_name = MODEL_NAMES.get(model_key, "неизвестная")
+        await message.answer(
+            f"🔹 Текущая модель: <b>{display_name}</b> (<code>{model_key}</code>)\n\n"
+            "Доступные:\n"
+            "/model deepseek — DeepSeek Chat v3.1\n"
+            "/model r1 — DeepSeek R1 0528\n"
+            "/model mistral — Mistral Small 24B\n"
+            "/model qwen — Qwen3 Coder\n"
+            "/model gemma — Google Gemma 3n E4B",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    model_key = args[1].strip().lower()
+    if model_key not in AVAILABLE_MODELS:
+        available_list = ", ".join(AVAILABLE_MODELS.keys())
+        await message.answer(f"❌ Модель '{model_key}' не найдена. Доступные: {available_list}")
+        return
+
+    user_model[user_id] = AVAILABLE_MODELS[model_key]
+    display_name = MODEL_NAMES[model_key]
+    await message.answer(f"✅ Модель изменена на: <b>{display_name}</b>", parse_mode=ParseMode.HTML)
+
+
+# Краткие команды для быстрого переключения
+for model_key in AVAILABLE_MODELS:
+
+    @router.message(F.text == f"/{model_key}")
+    async def quick_model_switch(message: Message, key=model_key):
+        user_id = message.from_user.id
+        user_model[user_id] = AVAILABLE_MODELS[key]
+        display_name = MODEL_NAMES[key]
+        await message.answer(f"✅ Мгновенно переключено на: <b>{display_name}</b>", parse_mode=ParseMode.HTML)
+
+
+@router.message(F.document)
+async def handle_document(message: Message):
+    user_id = message.from_user.id
+    file = message.document
+    file_name = file.file_name or "без_имени.txt"
+
+    if not file_name.lower().endswith(('.txt', '.py', '.js', '.html', '.css', '.md', '.json', '.yaml', '.yml')):
+        await message.answer("❌ Я могу обрабатывать только текстовые файлы (.txt, .py, .js, .md и т.д.)")
+        return
+
+    thinking_msg = None  # Объявляем заранее
+
+    try:
+        file_path = await message.bot.download(file)
+        
+        # ✅ Исправлено: используем file_path как путь
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        if len(content) > 4096:
+            content = content[:4096] + "\n... [обрезано]"
+
+        thinking_msg = await message.answer("📄 Читаю файл...")
+
+        async with openai_semaphore:
+            completion = await asyncio.to_thread(
+                lambda: client.chat.completions.create(
+                    model=user_model.get(user_id, "deepseek/deepseek-chat-v3.1"),
+                    messages=[
+                        {"role": "system", "content": "Объясни содержимое файла на русском."},
+                        {"role": "user", "content": f"Файл: {file_name}\n\n{content}"}
+                    ],
+                    temperature=0.7,
+                )
+            )
+
+        raw_reply = completion.choices[0].message.content.strip()
+        cleaned_reply = clean_ai_response(raw_reply)
+        non_code_parts, code_blocks = extract_code_blocks(cleaned_reply)
+
+        await thinking_msg.delete()
+
+        if non_code_parts:
+            full_text = ''.join(part for _, part in non_code_parts)
+            clean_text = sanitize_ai_html(full_text)
+            MAX_LEN = 4096
+            for i in range(0, len(clean_text), MAX_LEN):
+                chunk = clean_text[i:i + MAX_LEN]
+                await message.answer(chunk, parse_mode=ParseMode.HTML)
+
+        MAX_MESSAGE_LENGTH = 4096 - 100
+        for lang, code in code_blocks:
+            code_lines = code.strip().splitlines()
+            chunk = ""
+            current_length = 0
+
+            def make_code_block(text):
+                return f'<pre><code class="language-{html.escape(lang)}">{html.escape(text)}</code></pre>'
+
+            for line in code_lines:
+                line_escaped = html.escape(line) + "\n"
+                if current_length + len(line_escaped) > MAX_MESSAGE_LENGTH:
+                    if chunk:
+                        await message.answer(make_code_block(chunk), parse_mode=ParseMode.HTML)
+                    chunk = line
+                    current_length = len(line_escaped)
+                else:
+                    chunk += line + "\n"
+                    current_length += len(line_escaped)
+
+            if chunk.strip():
+                await message.answer(make_code_block(chunk), parse_mode=ParseMode.HTML)
+
+        logger.info(f"✅ Файл {file_name} обработан")
+
+    except Exception as e:
+        logger.error(f"Ошибка при обработке файла: {e}")
+        if thinking_msg:
+            await thinking_msg.delete()
+        await message.answer("⚠️ Ошибка при чтении файла.")
+
 
 @router.message(F.text)
 async def echo_handler(message: Message) -> None:
@@ -170,36 +370,47 @@ async def echo_handler(message: Message) -> None:
     user_text = message.text.strip()
     logger.info(f"📨 От {message.from_user.full_name}: {user_text}")
 
-    thinking_msg = await message.answer("💭 Думаю...")
-
+    thinking_msg = None
     try:
+        model = user_model.get(user_id, "deepseek/deepseek-chat-v3.1")
+
+        if user_id not in user_context:
+            user_context[user_id] = []
+
+        user_context[user_id].append({"role": "user", "content": user_text})
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Ты — ИИ-ассистент. Всегда отвечай на русском языке.\n"
+                    "• Для кода используй формат: ```py\\nкод\\n```\n"
+                    "• Для ссылок: <a href='https://example.com'>текст</a>\n"
+                    "• Жирный: <b>текст</b>, курсив: <i>текст</i>\n"
+                    "• Никогда не используй <pre> или <code> в ответе."
+                ),
+            }
+        ] + user_context[user_id]
+
+        thinking_msg = await message.answer("💭 Думаю...")
+
         async with openai_semaphore:
             completion = await asyncio.to_thread(
                 lambda: client.chat.completions.create(
-                    model="mistralai/mistral-7b-instruct",
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": (
-                                "Ты — ИИ-ассистент. Всегда отвечай на русском языке.\n"
-                                "• Для кода используй формат: ```py\\nкод\\n```\n"
-                                "• Для ссылок: <a href='https://example.com'>текст</a>\n"
-                                "• Жирный: <b>текст</b>, курсив: <i>текст</i>\n"
-                                "• Никогда не используй <pre> или <code> в ответе."
-                            ),
-                        },
-                        {"role": "user", "content": user_text},
-                    ],
+                    model=model,
+                    messages=messages,
                     temperature=0.7,
                 )
             )
 
-        ai_reply = completion.choices[0].message.content.strip()
-        non_code_parts, code_blocks = extract_code_blocks(ai_reply)
+        raw_reply = completion.choices[0].message.content.strip()
+        cleaned_reply = clean_ai_response(raw_reply)
+        user_context[user_id].append({"role": "assistant", "content": cleaned_reply})
+
+        non_code_parts, code_blocks = extract_code_blocks(cleaned_reply)
 
         await thinking_msg.delete()
 
-        # Сначала отправляем обычный текст (с HTML-разметкой)
         if non_code_parts:
             full_text = ''.join(part for _, part in non_code_parts)
             clean_text = sanitize_ai_html(full_text)
@@ -208,9 +419,7 @@ async def echo_handler(message: Message) -> None:
                 chunk = clean_text[i:i + MAX_LEN]
                 await message.answer(chunk, parse_mode=ParseMode.HTML)
 
-                # Отправка блоков кода с разбивкой на части
-        MAX_MESSAGE_LENGTH = 4096 - 100  # запас на теги
-
+        MAX_MESSAGE_LENGTH = 4096 - 100
         for lang, code in code_blocks:
             code_lines = code.strip().splitlines()
             chunk = ""
@@ -222,28 +431,26 @@ async def echo_handler(message: Message) -> None:
             for line in code_lines:
                 line_escaped = html.escape(line) + "\n"
                 if current_length + len(line_escaped) > MAX_MESSAGE_LENGTH:
-                    # Отправляем текущий кусок
                     if chunk:
                         await message.answer(make_code_block(chunk), parse_mode=ParseMode.HTML)
-                    # Начинаем новый
                     chunk = line
                     current_length = len(line_escaped)
                 else:
                     chunk += line + "\n"
                     current_length += len(line_escaped)
 
-            # Отправляем остаток
             if chunk.strip():
                 await message.answer(make_code_block(chunk), parse_mode=ParseMode.HTML)
 
-        logger.info("✅ Ответ отправлен (код как <pre><code>)")
+        logger.info("✅ Ответ отправлен")
 
     except Exception as e:
         logger.error(f"Ошибка: {e}")
-        try:
-            await thinking_msg.delete()
-        except Exception:
-            pass
+        if thinking_msg:
+            try:
+                await thinking_msg.delete()
+            except Exception:
+                pass
         await message.answer("⚠️ Ошибка генерации. Попробуйте позже.")
 
 
@@ -254,7 +461,7 @@ async def echo_handler(message: Message) -> None:
 async def main() -> None:
     bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp.include_router(router)
-    logger.info("🚀 Бот запущен!")
+    logger.info("🚀 OlvexAI Bot запущен!")
     await dp.start_polling(bot)
 
 
