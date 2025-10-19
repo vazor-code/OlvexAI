@@ -10,14 +10,16 @@ import html
 import uuid
 from urllib.parse import urlparse
 
-from aiogram import Bot, Dispatcher, Router
+from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
 from aiogram.types import Message
 
+# Загрузка переменных окружения из .env
 load_dotenv()
 
+# Настройка цветного логгера
 class ColoredFormatter(logging.Formatter):
     COLORS = {
         'INFO': '\x1b[36m',
@@ -44,22 +46,25 @@ logging.getLogger("aiogram").handlers.clear()
 logging.getLogger("aiogram").addHandler(handler)
 logging.getLogger("aiogram").setLevel(logging.INFO)
 
+# Проверка токенов
 TOKEN = getenv("BOT_TOKEN")
 AI_TOKEN = getenv("AI_TOKEN")
 if not TOKEN or not AI_TOKEN:
     raise RuntimeError("❌ BOT_TOKEN или AI_TOKEN не найден. Проверьте .env")
 
+# Инициализация OpenAI клиента (OpenRouter)
 client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=AI_TOKEN)
 
+# Настройка диспетчера
 dp = Dispatcher()
 router = Router()
 openai_semaphore = asyncio.Semaphore(3)
 
 # ---------------------------
-# Sanitizer: разрешаем только <b>, <i>, <u>, <s>, <a href="...">...</a>
+# Регулярные выражения для разбора форматированного текста
 # ---------------------------
 
-# Паттерны (нежадные)
+_code_block_pattern = re.compile(r'```(\w*)\s*\n(.*?)\n```', re.DOTALL | re.IGNORECASE)
 _link_pattern = re.compile(r'<a\s+href\s*=\s*["\']([^"\']*)["\']\s*>(.*?)</a>', re.IGNORECASE | re.DOTALL)
 _b_pattern = re.compile(r'<b>(.*?)</b>', re.IGNORECASE | re.DOTALL)
 _i_pattern = re.compile(r'<i>(.*?)</i>', re.IGNORECASE | re.DOTALL)
@@ -71,93 +76,71 @@ ALLOWED_SCHEMES = ("http", "https")
 def _is_safe_href(href: str) -> bool:
     try:
         parsed = urlparse(href)
-        if parsed.scheme.lower() in ALLOWED_SCHEMES and parsed.netloc:
-            return True
+        return parsed.scheme.lower() in ALLOWED_SCHEMES and bool(parsed.netloc)
     except Exception:
         return False
-    return False
+
+def extract_code_blocks(text: str):
+    """Извлекает блоки кода и возвращает остаток текста и список кодов."""
+    codes = []
+    non_code_parts = []
+
+    last_end = 0
+    for match in _code_block_pattern.finditer(text):
+        if match.start() > last_end:
+            non_code_parts.append(('text', text[last_end:match.start()]))
+        lang = match.group(1).strip() or "txt"
+        code_content = match.group(2).rstrip('\n')
+        codes.append((lang, code_content))
+        last_end = match.end()
+
+    if last_end < len(text):
+        non_code_parts.append(('text', text[last_end:]))
+
+    return non_code_parts, codes
 
 def sanitize_ai_html(text: str) -> str:
-    """
-    Принимает HTML-строку от ИИ и возвращает безопасный HTML,
-    содержащий только разрешённые теги (<b>, <i>, <u>, <s>, <a href="...">).
-    Всё остальное — эскейпится.
-    """
-
+    """Оставляет только безопасные HTML-теги: <b>, <i>, <u>, <s>, <a>."""
     placeholders = {}
-    # Уникальный токен генератор
-    def _make_token() -> str:
+
+    def make_token():
         return f"__PH_{uuid.uuid4().hex}__"
 
-    # 1) Вырежем разрешённые теги, сохраним их в плейсхолдерах.
-    def _save_link(m):
-        href = m.group(1)
-        inner = m.group(2) or ""
-        token = _make_token()
-        placeholders[token] = ("a", href, inner)
-        return token
+    # Сохраняем разрешённые теги через плейсхолдеры
+    temp = _link_pattern.sub(lambda m: (token := make_token(), placeholders.update({token: ("a", m.group(1), m.group(2))}) or token)[-1], text)
+    temp = _b_pattern.sub(lambda m: (token := make_token(), placeholders.update({token: ("b", m.group(1))}) or token)[-1], temp)
+    temp = _i_pattern.sub(lambda m: (token := make_token(), placeholders.update({token: ("i", m.group(1))}) or token)[-1], temp)
+    temp = _u_pattern.sub(lambda m: (token := make_token(), placeholders.update({token: ("u", m.group(1))}) or token)[-1], temp)
+    temp = _s_pattern.sub(lambda m: (token := make_token(), placeholders.update({token: ("s", m.group(1))}) or token)[-1], temp)
 
-    def _save_b(m):
-        inner = m.group(1) or ""
-        token = _make_token()
-        placeholders[token] = ("b", inner)
-        return token
-
-    def _save_i(m):
-        inner = m.group(1) or ""
-        token = _make_token()
-        placeholders[token] = ("i", inner)
-        return token
-
-    def _save_u(m):
-        inner = m.group(1) or ""
-        token = _make_token()
-        placeholders[token] = ("u", inner)
-        return token
-
-    def _save_s(m):
-        inner = m.group(1) or ""
-        token = _make_token()
-        placeholders[token] = ("s", inner)
-        return token
-
-    # Применяем по порядку (ссылки сначала)
-    temp = _link_pattern.sub(_save_link, text)
-    temp = _b_pattern.sub(_save_b, temp)
-    temp = _i_pattern.sub(_save_i, temp)
-    temp = _u_pattern.sub(_save_u, temp)
-    temp = _s_pattern.sub(_save_s, temp)
-
-    # 2) Эскейпим всё, что осталось (это удалит любые незапрошенные теги)
+    # Экранируем весь остальной HTML
     escaped = html.escape(temp)
 
-    # 3) Вставляем назад безопасные теги (с эскейпом их содержимого и валидацией href)
+    # Восстанавливаем разрешённые теги
     for token, data in placeholders.items():
-        if data[0] == "a":
-            _, href, inner = data
+        tag = data[0]
+        if tag == "a":
+            href, inner = data[1], data[2]
             inner_esc = html.escape(inner)
             if _is_safe_href(href):
                 href_esc = html.escape(href, quote=True)
                 replacement = f'<a href="{href_esc}">{inner_esc}</a>'
             else:
-                # Небезопасный href — вставляем только текст ссылки (без тега)
                 replacement = inner_esc
-        elif data[0] == "b":
+        elif tag == "b":
             replacement = f"<b>{html.escape(data[1])}</b>"
-        elif data[0] == "i":
+        elif tag == "i":
             replacement = f"<i>{html.escape(data[1])}</i>"
-        elif data[0] == "u":
+        elif tag == "u":
             replacement = f"<u>{html.escape(data[1])}</u>"
-        elif data[0] == "s":
+        elif tag == "s":
             replacement = f"<s>{html.escape(data[1])}</s>"
         else:
             replacement = html.escape(str(data))
-
-        # token в escaped не будет преобразован html.escape'ом, потому что
-        # token состоит из безопасных ASCII-символов (буквы/цифры/подчёрки).
         escaped = escaped.replace(token, replacement)
 
     return escaped
+
 
 # ---------------------------
 # Хэндлеры
@@ -166,23 +149,37 @@ def sanitize_ai_html(text: str) -> str:
 @router.message(CommandStart())
 async def command_start_handler(message: Message) -> None:
     user = message.from_user
-    # Используем HTML-парсинг, поэтому экранируем имя
-    safe_name = html.escape(user.full_name or "пользователь")
+    safe_name = html.escape(user.full_name or "Пользователь")
     welcome_text = (
         f"Привет, <b>{safe_name}</b>! 👋\n\n"
         "🧠 Добро пожаловать в <b>OlvexAI</b> — ваш персональный ИИ-ассистент.\n"
-        "Я могу генерировать текст, писать код, объяснять сложное и многое другое.\n\n"
-        "Просто напиши своё первое сообщение — и поехали."
+        "Я могу:\n"
+        "• Писать и объяснять код\n"
+        "• Отвечать на вопросы\n"
+        "• Помогать с учёбой и работой\n\n"
+        "<i>Просто напишите, что вам нужно!</i>"
     )
-
     logger.info(f"👋 /start от {user.full_name} (id={user.id})")
-    # Явно передаём parse_mode=HTML — это безопаснее и понятнее
     await message.answer(welcome_text, parse_mode=ParseMode.HTML)
 
-@router.message()
+
+# Глобальная защита от флуда
+FLOOD_COOLDOWN = 2
+user_last_message = {}
+
+@router.message(F.text)
 async def echo_handler(message: Message) -> None:
+    user_id = message.from_user.id
+    now = asyncio.get_event_loop().time()
+
+    if user_id in user_last_message and now - user_last_message[user_id] < FLOOD_COOLDOWN:
+        return  # Игнорируем слишком частые сообщения
+
+    user_last_message[user_id] = now
+
     user = message.from_user
-    logger.info(f"📨 Сообщение от {user.full_name}: {message.text}")
+    user_text = message.text.strip()
+    logger.info(f"📨 Сообщение от {user.full_name}: {user_text}")
 
     thinking_msg = await message.answer("💭 Думаю над ответом...")
 
@@ -195,51 +192,59 @@ async def echo_handler(message: Message) -> None:
                         {
                             "role": "system",
                             "content": (
-                                "Ты ассистент. Используй только HTML-теги: "
-                                "<b>, <i>, <u>, <s>, <a>. "
-                                "Не используйте <code> или <pre> — их Telegram не принимает."
+                                "Ты — полезный ассистент. Форматируй ответы так:\n"
+                                "• Для кода используй: ```py\\nкод\\n```\n"
+                                "• Для ссылок: <a href='https://example.com'>сайт</a>\n"
+                                "• Жирный: <b>текст</b>, курсив: <i>текст</i>\n"
+                                "• Никогда не используй <pre>, <code>, <br>."
                             ),
                         },
-                        {"role": "user", "content": message.text},
+                        {"role": "user", "content": user_text},
                     ],
                     temperature=0.7,
                 )
             )
 
         ai_reply = completion.choices[0].message.content.strip()
-        # Санитизируем HTML от ИИ, разрешая только нужные теги
-        formatted_reply = sanitize_ai_html(ai_reply)
+        non_code_parts, code_blocks = extract_code_blocks(ai_reply)
+
         await thinking_msg.delete()
 
-        MAX_LEN = 4096
-        # Отправляем, нарезая по лимиту Telegram
-        if len(formatted_reply) <= MAX_LEN:
-            await message.answer(formatted_reply, parse_mode=ParseMode.HTML)
-        else:
-            # Разбиваем аккуратно — при желании можно разбивать по предложениям,
-            # но базовая нарезка по символам тоже работает.
-            for i in range(0, len(formatted_reply), MAX_LEN):
-                chunk = formatted_reply[i:i + MAX_LEN]
+        # Отправляем обычный текст (HTML)
+        if non_code_parts:
+            full_text = ''.join(part for _, part in non_code_parts)
+            cleaned_text = sanitize_ai_html(full_text)
+            MAX_LEN = 4096
+            for i in range(0, len(cleaned_text), MAX_LEN):
+                chunk = cleaned_text[i:i + MAX_LEN]
                 await message.answer(chunk, parse_mode=ParseMode.HTML)
 
-        logger.info(f"🤖 Ответ пользователю {user.full_name}: {ai_reply[:80]}...")
+        # Отправляем блоки кода отдельно (как Markdown)
+        for lang, code in code_blocks:
+            code_msg = f"```{lang}\n{code}\n```"
+            await message.answer(code_msg, parse_mode=None)
+
+        logger.info(f"✅ Ответ отправлен пользователю {user.full_name}")
 
     except Exception as e:
-        logger.error(f"Ошибка при запросе к DeepSeek: {e}")
+        logger.error(f"Ошибка при запросе к ИИ: {e}")
         try:
             await thinking_msg.delete()
         except Exception:
             pass
-        err = "⚠️ Ошибка при генерации ответа. Попробуй позже."
-        await message.answer(html.escape(err), parse_mode=ParseMode.HTML)
+        await message.answer("⚠️ Ошибка генерации. Попробуйте позже.", parse_mode=ParseMode.HTML)
+
+
+# ---------------------------
+# Запуск бота
+# ---------------------------
 
 async def main() -> None:
-    # Устанавливаем HTML как дефолтный режим парсинга
     bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp.include_router(router)
-
     logger.info("🚀 Бот OlvexAI запущен и готов к работе!")
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     try:
