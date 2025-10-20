@@ -284,13 +284,13 @@ def clean_ai_response(text: str) -> str:
 # ---------------------------
 
 AVAILABLE_MODELS = {
-    "deepseek": "deepseek/deepseek-chat-v3.1",
-    "r1": "deepseek/deepseek-r1-0528",
-    "qwen8b": "deepseek/deepseek-r1-0528-qwen3-8b",
-    "mistral": "mistralai/mistral-small-3.2-24b-instruct",
-    "qwen": "qwen/qwen3-coder",
-    "gemma": "google/gemma-3n-e4b-it",
-    "gpt20b": "openai/gpt-oss-20b",
+    "deepseek": "deepseek/deepseek-chat-v3.1:free",
+    "r1": "deepseek/deepseek-r1-0528:free",
+    "qwen8b": "deepseek/deepseek-r1-0528-qwen3-8b:free",
+    "mistral": "mistralai/mistral-small-3.2-24b-instruct:free",
+    "qwen": "qwen/qwen3-coder:free",
+    "gemma": "google/gemma-3n-e4b-it:free",
+    "gpt20b": "openai/gpt-oss-20b:free",
 }
 
 
