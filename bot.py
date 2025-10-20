@@ -10,6 +10,7 @@ import html
 import uuid
 from urllib.parse import urlparse
 import json
+import os
 from pathlib import Path
 from typing import List
 from aiogram import Bot, Dispatcher, Router, F
@@ -37,10 +38,27 @@ def save_user_ids(user_ids_set):
     with open(USERS_FILE, 'w') as f:
         json.dump(sorted(list(user_ids_set)), f)
 
+# Путь к файлу с моделями пользователей
+USER_MODELS_FILE = Path("user_models.json")
+
+def load_user_models():
+    if USER_MODELS_FILE.exists():
+        try:
+            with open(USER_MODELS_FILE, 'r') as f:
+                data = json.load(f)
+                return {int(k): v for k, v in data.items()}
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return {}
+
+def save_user_models(user_models_dict):
+    with open(USER_MODELS_FILE, 'w') as f:
+        json.dump({str(k): v for k, v in user_models_dict.items()}, f)
+
 # Глобальные переменные
 user_ids = load_user_ids()
 user_context = {}
-user_model = {}
+user_model = load_user_models()
 user_last_message = {}
 FLOOD_COOLDOWN = 1.5
 MAX_CONTEXT_MESSAGES = 10
@@ -358,6 +376,7 @@ async def show_model(message: Message):
 async def quick_switch(message: Message):
     key = message.text.lstrip("/")
     user_model[message.from_user.id] = AVAILABLE_MODELS[key]
+    save_user_models(user_model)
     await message.answer(f"✅ Модель переключена на <b>{MODEL_NAMES[key]}</b>", parse_mode=ParseMode.HTML)
 
 # --- Очистка контекста ---
@@ -419,6 +438,37 @@ async def show_stats(message: Message):
         parse_mode=ParseMode.HTML
     )
 
+@router.message(F.text == "/test_model")
+async def test_models(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("❌ У вас нет прав на тестирование моделей.")
+        return
+
+    await message.answer("🧪 <b>Тестирование моделей начато...</b>", parse_mode=ParseMode.HTML)
+    test_message = "Привет, ты работаешь?"
+    results = []
+
+    for key, model_id in AVAILABLE_MODELS.items():
+        try:
+            async with openai_semaphore:
+                completion = await asyncio.to_thread(lambda: client.chat.completions.create(
+                    model=model_id,
+                    messages=[{"role": "user", "content": test_message}],
+                    temperature=0.7,
+                    max_tokens=100  # Увеличено для более полной проверки
+                ))
+            raw_response = completion.choices[0].message.content
+            cleaned_response = clean_ai_response(raw_response).strip()  # Применяем ту же очистку, что и в основном обработчике
+            if cleaned_response:
+                results.append(f"✅ {MODEL_NAMES[key]}: OK")
+            else:
+                results.append(f"⚠️ {MODEL_NAMES[key]}: Пустой ответ или могут быть неполадки на сервисе")
+        except Exception as e:
+            results.append(f"❌ {MODEL_NAMES[key]}: Ошибка - {str(e)[:100]}")
+
+    result_text = "\n".join(results)
+    await message.answer(f"📋 <b>Результаты тестирования:</b>\n\n{result_text}", parse_mode=ParseMode.HTML)
+
 # --- Повтор ---
 @router.message(F.text == "/retry")
 async def retry_last(message: Message):
@@ -436,8 +486,9 @@ async def retry_last(message: Message):
 @router.message(F.document)
 async def handle_document(message: Message):
     doc = message.document
-    if not doc.file_name.lower().endswith((".txt", ".py", ".js", ".md", ".json")):
-        await message.answer("⚠️ Поддерживаются только текстовые файлы.")
+    supported_extensions = (".txt", ".py", ".js", ".md", ".json", ".csv", ".yaml", ".yml", ".xml", ".html", ".css", ".ini", ".toml", ".java", ".go", ".c", ".cpp", ".rs", ".sh", ".bat", ".ps1", ".sql")
+    if not doc.file_name.lower().endswith(supported_extensions):
+        await message.answer("⚠️ Поддерживаются только текстовые файлы с расширениями: txt, py, js, md, json, csv, yaml, yml, xml, html, css, ini, toml, java, go, c, cpp, rs, sh, bat, ps1, sql.")
         return
     file = await message.bot.get_file(doc.file_id)
     path = await message.bot.download_file(file.file_path)
